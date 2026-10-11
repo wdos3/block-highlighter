@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"id": "block-highlighter",
+	"version": "${version}",
+	"name": "Block Highlighter",
+	"description": "A client-side Fabric block finder with shape-accurate through-wall outlines.",
+	"authors": ["Lam"],
+	"contact": {
+		"sources": "https://github.com/wdos3/block-highlighter",
+		"issues": "https://github.com/wdos3/block-highlighter/issues"
+	},
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"com.example.blockhighlighter.client.BlockHighlighterClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "=1.21.11",
+		"java": ">=21",
+		"fabric-api": ">=0.141.6"
+	}
+}

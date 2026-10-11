@@ -1,0 +1,15 @@
+.gradle/
+build/
+run/
+backups/
+
+### IDEs ###
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+### OS files ###
+Thumbs.db
+.DS_Store

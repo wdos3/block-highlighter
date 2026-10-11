@@ -1,0 +1,148 @@
+# Block Highlighter
+
+Block Highlighter is a client-side Fabric mod for Minecraft Java Edition 1.21.11. Select block types from the live Minecraft block registry, then see loaded matches within a configurable radius as bright, shape-accurate outlines—even through opaque terrain.
+
+## Requirements
+
+- Minecraft Java Edition 1.21.11
+- Fabric Loader 0.19.3 or newer
+- Fabric API 0.141.6+1.21.11 or newer for 1.21.11
+- Java 21
+
+The mod is client-only. It does not need to be installed on a server and does not send custom packets, change blocks, automate interaction, or bypass server rules.
+
+## Installation
+
+1. Install Fabric Loader for Minecraft 1.21.11.
+2. Put the matching Fabric API jar and the built `block-highlighter-1.0.0+1.21.11.jar` in the client `mods` directory.
+3. Start the Fabric 1.21.11 profile.
+
+The build output is created in `build/libs/`. Do not use the `-dev` or `-sources` jars in the game `mods` folder.
+
+## Controls
+
+| Control | Default key | Description |
+| --- | ---: | --- |
+| Open Block Highlighter | `/blockhighlighter` or `/bh` | Open the selector and settings screen |
+| Toggle Block Highlighting | H | Enable or disable outline rendering and scanning |
+| Add Looked-at Block | J | Add the block under the crosshair; hold Shift to remove it |
+
+The toggle and quick-add controls are registered with Minecraft's normal key binding system and can be changed under **Options → Controls → Key Binds**. The selector is opened with the client-side `/blockhighlighter` command; `/bh` is a short alias.
+
+The selector commands are client-side and are installed when the client joins a world. After replacing the jar, restart Minecraft and join the world again before trying `/bh`; they do not need to exist on the server.
+
+## Selector and settings
+
+The screen has two scrollable columns:
+
+- **Available Blocks** contains every block currently registered in `Registries.BLOCK`, including blocks without a conventional item form.
+- **Selected Blocks** contains the configured block types.
+
+Click an available row to add it and click a selected row to remove it. The search field filters both columns immediately by translated name, registry ID, or a loose fuzzy subsequence match. A confirmation prompt protects **Clear All**.
+
+The settings controls configure:
+
+- highlighting enabled/disabled;
+- search radius from 16 to 256 blocks (default 64);
+- nearby-world refresh interval from 1 to 120 seconds (default 60);
+- the global six-digit RGB color (default `#00FFFF`);
+- opacity from 15% to 100% (default 85%);
+- line width from 1.0 to 4.0 (default 2.0);
+- the small on-screen HUD status indicator.
+
+## Screenshots
+
+![Diamond ore outlined through a solid stone wall in the Minecraft 1.21.11 development client](docs/screenshots/through-wall-diamond-ore.png)
+
+This is an in-game screenshot from the manual smoke test, not a mockup. A diamond ore block at `(0, 110, 5)` is completely behind a stone wall at `z=3`; the player is looking toward it from `(0.5, 109, 0.5)`. The cyan outline remains visible while the stone stays opaque. The selector opened with `/bh`, and turning highlighting off removed the outline.
+
+## Configuration
+
+The file is stored at:
+
+`.minecraft/config/block-highlighter/config.json`
+
+Selections are persisted by registry ID rather than display name. A typical configuration looks like:
+
+```json
+{
+  "configVersion": 1,
+  "enabled": true,
+  "radius": 64,
+  "refreshSeconds": 60,
+  "hudEnabled": true,
+  "defaultColor": "#00FFFF",
+  "opacity": 0.85,
+  "lineWidth": 2.0,
+  "selectedBlocks": {
+    "minecraft:diamond_ore": {
+      "enabled": true
+    },
+    "minecraft:ancient_debris": {
+      "enabled": true,
+      "color": "#FF8000"
+    }
+  }
+}
+```
+
+The current screen exposes the global color; the per-block `color` field is accepted for forward-compatible configuration and can be edited manually. Invalid colors are normalized to the global default. Unknown block IDs are ignored with a warning. Malformed files are copied to a timestamped `.broken` backup before defaults are written. Saves use a temporary file and an atomic move where the filesystem supports it.
+
+## How highlighting works
+
+The scanner discovers only client-loaded chunks near the player. It processes at most 4,096 block positions per client tick, with a 2 ms time budget to protect the client tick. Each chunk starts scanning at the player's Y-level so nearby matches are found promptly, and partial matches are published while the rest of the chunk is scanned. The completed result replaces the chunk's match set. At the configured refresh interval, a new pass over cached nearby chunks is queued, with closer chunks first; the previous result remains visible until each refreshed chunk finishes. Unloaded chunks are removed, and everything resets when the client world or dimension changes. The interval controls when a pass begins, not a guaranteed completion deadline: a large radius or many loaded chunks can take longer to finish under the per-tick scan budget.
+
+The renderer rebuilds a world-coordinate vertex buffer only when the cache, player block position, settings, or periodic state refresh changes. It does not rebuild outlines every render frame; the camera transform is supplied dynamically to the GPU. During a rebuild it checks the current state and exact player distance, then asks the state for its current `VoxelShape`. All shape edges are emitted, including multiple boxes, so slabs, stairs, fences, walls, buttons, trapdoors, doors, plants, snow layers, rails, and other non-cubic shapes retain their geometry. Empty outline shapes fall back to collision geometry and then a conservative local block box; air states are skipped.
+
+Minecraft 1.21.11 has a substantially changed render pipeline. The mod uses the 1.21.11 `END_MAIN` world-render drawing event and a dedicated pipeline based on the vanilla line shader's screen-space expansion. Its mod-owned shader omits fog because the reusable buffer stores world coordinates, while the camera transform is applied dynamically. The pipeline uses `NO_DEPTH_TEST`, writes no depth, and renders into the main framebuffer only for the outline draw. Drawing at `END_MAIN` keeps the direct framebuffer result from being overwritten by later world passes. It does not globally disable depth testing or replace terrain textures. A three-buffer GPU ring is used for geometry rebuilds so the render thread does not reuse an in-flight buffer. The pipeline is registered through the public 1.21.11 `RenderPipelines.register` API.
+
+## Performance and compatibility
+
+- No full-world scan occurs per frame.
+- Discovery, scanning, pruning, and periodic refresh run on the client thread.
+- Rendering is bounded at 8,192 cached positions as a safety valve for selections such as stone over a large radius; the cache itself still records all matches. The uploaded geometry is reused across frames, so this bound does not represent a per-frame world scan.
+- Shape queries use the current block state and world, not a static shape for the selected block type.
+- No Sodium or Iris internals are used. The custom pipeline is expected to work with vanilla's modern backend and should coexist with common Fabric performance mods. Renderer-specific replacements that bypass Fabric's world-render event may require their own compatibility testing.
+
+## Build
+
+From the repository root on Windows:
+
+```powershell
+$env:JAVA_HOME = 'C:\path\to\jdk-21'
+.\gradlew.bat build
+```
+
+Useful focused checks:
+
+```powershell
+.\gradlew.bat test
+.\gradlew.bat runClient
+```
+
+The automated tests cover color parsing, config round trips, range validation, malformed JSON fallback, and search matching. Rendering requires a graphical development client.
+
+## Manual smoke test
+
+In a development client:
+
+1. Confirm the title screen loads with the Fabric profile and no mixin error.
+2. Run `/blockhighlighter`. Confirm both columns contain registered blocks, icons appear when an item form exists, and `diamond` / `minecraft:oak_button` filter immediately.
+3. Add a flower, button, slab, stair, and ore. Close and reopen the screen; confirm they remain selected.
+4. Toggle with H and verify the HUD/action-bar state changes.
+5. Set **World refresh** to 1 second, close and reopen the screen to confirm persistence, and verify a newly placed selected block appears after a scan pass. Try 120 seconds and confirm the value persists too.
+6. Place selected shapes in a test world, put stone between the player and them, and verify the outlines remain visible through the wall without terrain becoming transparent.
+7. Change a stair orientation, open a trapdoor, alter a snow layer, connect a fence, break/place blocks, and wait for the incremental cache refresh; confirm the outline follows the current state.
+8. Walk into new chunks, change dimensions, leave/rejoin, and join another server. Confirm unloaded or old-dimension positions do not remain visible.
+9. Select a common block at a modest radius and verify frame rate remains stable while the scanner progresses.
+
+## Known limitations
+
+- Named presets and preset import/export are intentionally not included in this first stable core implementation.
+- Per-block colors are supported by the versioned JSON model, but the compact native screen currently edits the global color only.
+- The 8,192-position render safety limit means an unusually broad selection of extremely common blocks may not draw every cached match at once; the cache still records all matches and the selection should be narrowed for complete coverage of very common blocks.
+- Some renderer replacements that do not invoke Fabric's 1.21.11 world-render event may require renderer-specific compatibility work.
+
+## License
+
+MIT
