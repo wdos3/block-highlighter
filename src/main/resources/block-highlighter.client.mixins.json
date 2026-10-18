@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "com.example.blockhighlighter.mixin.client",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["ClientWorldMixin"],
+  "injectors": {"defaultRequire": 1}
+}

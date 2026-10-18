@@ -2,6 +2,7 @@
 build/
 run/
 backups/
+logs/
 
 ### IDEs ###
 .idea/

@@ -11,6 +11,7 @@
 	},
 	"license": "MIT",
 	"environment": "client",
+	"mixins": ["block-highlighter.client.mixins.json"],
 	"entrypoints": {
 		"client": [
 			"com.example.blockhighlighter.client.BlockHighlighterClient"

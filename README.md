@@ -14,7 +14,7 @@ The mod is client-only. It does not need to be installed on a server and does no
 ## Installation
 
 1. Install Fabric Loader for Minecraft 1.21.11.
-2. Put the matching Fabric API jar and the built `block-highlighter-1.0.0+1.21.11.jar` in the client `mods` directory.
+2. Put the matching Fabric API jar and the built `block-highlighter-1.0.1+1.21.11.jar` in the client `mods` directory. Remove the older Block Highlighter jar so only one version is installed.
 3. Start the Fabric 1.21.11 profile.
 
 The build output is created in `build/libs/`. Do not use the `-dev` or `-sources` jars in the game `mods` folder.
@@ -90,7 +90,11 @@ The current screen exposes the global color; the per-block `color` field is acce
 
 ## How highlighting works
 
-The scanner discovers only client-loaded chunks near the player. It processes at most 4,096 block positions per client tick, with a 2 ms time budget to protect the client tick. Each chunk starts scanning at the player's Y-level so nearby matches are found promptly, and partial matches are published while the rest of the chunk is scanned. The completed result replaces the chunk's match set. At the configured refresh interval, a new pass over cached nearby chunks is queued, with closer chunks first; the previous result remains visible until each refreshed chunk finishes. Unloaded chunks are removed, and everything resets when the client world or dimension changes. The interval controls when a pass begins, not a guaranteed completion deadline: a large radius or many loaded chunks can take longer to finish under the per-tick scan budget.
+The scanner discovers only client-loaded chunks inside a conservative bounding box around the configured radius, clipped to the world's build limits. It no longer scans each chunk's entire height or extra chunk rings. Section palettes skip regions that cannot contain a selected block, and scanning starts near the player's Y-level. Matches are updated incrementally instead of waiting for a complete chunk pass. The renderer still applies the exact spherical distance check.
+
+Client block updates are collected without scanning the world. At each **World refresh** deadline, changed positions become eligible and are checked **before** background discovery or periodic rescans. This prevents ordinary block placements from waiting behind a large scan queue. Background scans do not publish pending changes before their deadline. Full chunk packets invalidate their old cache and trigger bounded rediscovery; unloading or changing worlds removes obsolete state.
+
+Refresh timing uses a monotonic real-time clock, not an assumption of 20 client ticks per second. Changing the slider cancels old periodic work, preserves pending changes, and starts a fresh interval. Disabling highlighting or pausing a singleplayer world restarts the interval on resume. Work remains capped at 4,096 block positions and approximately 2 ms per client tick: normal changed positions are handled at the next deadline plus client-tick processing latency, while extremely large bulk updates or initial discovery can still take longer. Removed outlines and shape changes can appear sooner because the renderer independently validates already-known positions.
 
 The renderer rebuilds a world-coordinate vertex buffer only when the cache, player block position, settings, or periodic state refresh changes. It does not rebuild outlines every render frame; the camera transform is supplied dynamically to the GPU. During a rebuild it checks the current state and exact player distance, then asks the state for its current `VoxelShape`. All shape edges are emitted, including multiple boxes, so slabs, stairs, fences, walls, buttons, trapdoors, doors, plants, snow layers, rails, and other non-cubic shapes retain their geometry. Empty outline shapes fall back to collision geometry and then a conservative local block box; air states are skipped.
 
@@ -120,7 +124,9 @@ Useful focused checks:
 .\gradlew.bat runClient
 ```
 
-The automated tests cover color parsing, config round trips, range validation, malformed JSON fallback, and search matching. Rendering requires a graphical development client.
+The automated tests cover color parsing, config round trips, range validation, malformed JSON fallback, search matching, real-time refresh deadlines, interval changes, update-queue eligibility, bounded scan regions, and incremental cache consistency. Rendering requires a graphical development client.
+
+See [refresh timing validation](docs/refresh-timing-validation.md) for the measured 1/5/10/60/120-second live-world checks and native rendering capture for version 1.0.1.
 
 ## Manual smoke test
 
@@ -130,7 +136,7 @@ In a development client:
 2. Run `/blockhighlighter`. Confirm both columns contain registered blocks, icons appear when an item form exists, and `diamond` / `minecraft:oak_button` filter immediately.
 3. Add a flower, button, slab, stair, and ore. Close and reopen the screen; confirm they remain selected.
 4. Toggle with H and verify the HUD/action-bar state changes.
-5. Set **World refresh** to 1 second, close and reopen the screen to confirm persistence, and verify a newly placed selected block appears after a scan pass. Try 120 seconds and confirm the value persists too.
+5. Set **World refresh** to 1 second, close and reopen the screen to confirm persistence, and place distinct selected blocks about one second apart. Confirm new outlines follow the selected cadence instead of appearing in a 20–30 second batch. Repeat at 5, 10, 60, and 120 seconds, allowing a full new interval after changing the slider. Also test a large radius while initial discovery is active.
 6. Place selected shapes in a test world, put stone between the player and them, and verify the outlines remain visible through the wall without terrain becoming transparent.
 7. Change a stair orientation, open a trapdoor, alter a snow layer, connect a fence, break/place blocks, and wait for the incremental cache refresh; confirm the outline follows the current state.
 8. Walk into new chunks, change dimensions, leave/rejoin, and join another server. Confirm unloaded or old-dimension positions do not remain visible.

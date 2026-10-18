@@ -7,31 +7,38 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.chunk.WorldChunk;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public final class BlockScanner {
 	private static final int BLOCKS_PER_TICK = 4_096;
 	private static final int SCAN_BATCH_SIZE = 256;
 	private static final long MAX_SCAN_NANOS_PER_TICK = 2_000_000L;
-	private static final int PRUNE_INTERVAL_TICKS = 20;
+	private static final int DISCOVERY_INTERVAL_TICKS = 20;
 
 	private final HighlightConfig config;
 	private final SelectedBlockManager selectedBlocks;
 	private final HighlightCache cache;
 	private final RefreshCycle refreshCycle = new RefreshCycle();
+	private final PendingBlockUpdates updates = new PendingBlockUpdates();
 	private final ArrayDeque<ScanTask> queue = new ArrayDeque<>();
 	private final Set<Long> queuedChunks = new HashSet<>();
+	private final Map<Long, ScanRegion> scannedRegions = new HashMap<>();
+	private List<ChunkPos> nearbyChunks = List.of();
 	private ClientWorld currentWorld;
-	private Object currentDimension;
-	private long ticks;
-	private int scanCenterY;
-	private int scannedRadius = -1;
+	private ScanRegion region;
+	private int ticks;
+	private int scheduledSeconds = -1;
 
 	public BlockScanner(HighlightConfig config, SelectedBlockManager selectedBlocks, HighlightCache cache) {
 		this.config = config;
@@ -49,229 +56,268 @@ public final class BlockScanner {
 			reset();
 			return;
 		}
-		Object dimension = world.getRegistryKey();
-		if (world != currentWorld || !dimension.equals(currentDimension)) {
-			resetForWorld(world, dimension);
+		if (world != currentWorld) {
+			reset();
+			currentWorld = world;
 		}
-		if (scannedRadius != config.radius) {
-			invalidateLoadedChunks();
-			scannedRadius = config.radius;
-		}
-		if (!config.enabled || selectedBlocks.idSet().isEmpty()) {
+		if (!config.enabled || selectedBlocks.idSet().isEmpty() || client.isPaused()) {
+			cancelPeriodicWork();
+			refreshCycle.reset();
 			return;
 		}
 
-		ticks++;
-		scanCenterY = client.player.getBlockPos().getY();
-		discoverLoadedChunks(world, client.player.getBlockPos());
-		if (ticks % PRUNE_INTERVAL_TICKS == 0) {
-			pruneUnloadedChunks(world);
+		BlockPos player = client.player.getBlockPos();
+		ScanRegion next = ScanRegion.around(player.getX(), player.getY(), player.getZ(),
+				config.radius, world.getBottomY(), world.getHeight());
+		boolean moved = !next.equals(region);
+		if (moved) {
+			region = next;
+			rebuildNearbyChunks(player);
+			pruneOutsideRegion(world);
 		}
-		if (refreshCycle.tick(config.refreshSeconds)) {
-			schedulePeriodicRefresh(world, client.player.getBlockPos());
+		if (config.refreshSeconds != scheduledSeconds) {
+			cancelPeriodicWork();
+			refreshCycle.reset();
+			scheduledSeconds = config.refreshSeconds;
+		}
+		if (moved || ticks++ % DISCOVERY_INTERVAL_TICKS == 0) {
+			discoverLoadedChunks(world, player.getY());
+		}
+		if (refreshCycle.poll(System.nanoTime(), scheduledSeconds)) {
+			updates.beginCycle();
+			schedulePeriodicRefresh(world, player.getY());
 		}
 		processQueue(world);
+	}
+
+	public void blockUpdated(ClientWorld world, BlockPos pos) {
+		if (world == currentWorld && config.enabled && region != null
+				&& region.contains(pos.getX(), pos.getY(), pos.getZ()) && !selectedBlocks.idSet().isEmpty()) {
+			updates.record(pos.asLong());
+		}
+	}
+
+	public void chunkLoaded(ClientWorld world, ChunkPos chunk) {
+		if (world == currentWorld) {
+			removeChunk(chunk.toLong());
+			// A full chunk packet can replace every state without individual updates.
+			// Discovery will rescan its bounded region on the next client tick.
+			ticks = 0;
+		}
+	}
+
+	public void chunkUnloaded(ClientWorld world, ChunkPos chunk) {
+		if (world == currentWorld) {
+			removeChunk(chunk.toLong());
+		}
 	}
 
 	public void invalidateLoadedChunks() {
 		queue.clear();
 		queuedChunks.clear();
-		cache.clear();
-		refreshCycle.reset();
-	}
-
-	public void reset() {
-		currentWorld = null;
-		currentDimension = null;
-		queue.clear();
-		queuedChunks.clear();
+		scannedRegions.clear();
+		updates.clear();
 		cache.clear();
 		refreshCycle.reset();
 		ticks = 0;
-		scanCenterY = 0;
-		scannedRadius = -1;
 	}
 
-	private void resetForWorld(ClientWorld world, Object dimension) {
-		reset();
-		currentWorld = world;
-		currentDimension = dimension;
+	public void reset() {
+		invalidateLoadedChunks();
+		currentWorld = null;
+		region = null;
+		nearbyChunks = List.of();
+		scheduledSeconds = -1;
 	}
 
-	private void discoverLoadedChunks(ClientWorld world, BlockPos playerPos) {
-		int chunkRadius = Math.max(1, (config.radius + 15) / 16 + 1);
-		ChunkPos center = new ChunkPos(playerPos);
-		// Queue the closest chunks first. This keeps a newly selected block near the
-		// player from waiting behind the far edge of the scan square.
-		if (world.isChunkLoaded(center.x, center.z)) {
-			enqueueIfNeeded(center.x, center.z);
-		}
-		for (int ring = 1; ring <= chunkRadius; ring++) {
-			for (int offset = -ring; offset <= ring; offset++) {
-				enqueueLoaded(world, center.x + offset, center.z - ring);
-				enqueueLoaded(world, center.x + offset, center.z + ring);
-			}
-			for (int offset = -ring + 1; offset < ring; offset++) {
-				enqueueLoaded(world, center.x - ring, center.z + offset);
-				enqueueLoaded(world, center.x + ring, center.z + offset);
+	private void rebuildNearbyChunks(BlockPos player) {
+		List<ChunkPos> chunks = new ArrayList<>();
+		if (region.volume() > 0) {
+			for (int x = region.minX() >> 4; x <= region.maxX() >> 4; x++) {
+				for (int z = region.minZ() >> 4; z <= region.maxZ() >> 4; z++) {
+					chunks.add(new ChunkPos(x, z));
+				}
 			}
 		}
+		ChunkPos center = new ChunkPos(player);
+		chunks.sort(Comparator.comparingLong(chunk -> {
+			long dx = (long) chunk.x - center.x;
+			long dz = (long) chunk.z - center.z;
+			return dx * dx + dz * dz;
+		}));
+		nearbyChunks = chunks;
 	}
 
-	private void enqueueLoaded(ClientWorld world, int chunkX, int chunkZ) {
-		if (world.isChunkLoaded(chunkX, chunkZ)) {
-			enqueueIfNeeded(chunkX, chunkZ);
+	private void discoverLoadedChunks(ClientWorld world, int playerY) {
+		for (ChunkPos chunk : nearbyChunks) {
+			ScanRegion target = region.inChunk(chunk.x, chunk.z);
+			ScanRegion previous = scannedRegions.get(chunk.toLong());
+			if (world.isChunkLoaded(chunk.x, chunk.z) && (previous == null || !previous.contains(target))) {
+				enqueue(chunk, target, playerY, true);
+			}
 		}
 	}
 
-	private void enqueueIfNeeded(int chunkX, int chunkZ) {
-		long chunkKey = ChunkPos.toLong(chunkX, chunkZ);
-		if (!cache.containsChunk(chunkKey) && queuedChunks.add(chunkKey)) {
-			queue.addLast(new ScanTask(chunkX, chunkZ, scanCenterY, currentWorld.getBottomY(), currentWorld.getHeight(), true));
+	private void schedulePeriodicRefresh(ClientWorld world, int playerY) {
+		for (ChunkPos chunk : nearbyChunks) {
+			if (world.isChunkLoaded(chunk.x, chunk.z)) {
+				enqueue(chunk, region.inChunk(chunk.x, chunk.z), playerY, false);
+			}
+		}
+	}
+
+	private void enqueue(ChunkPos chunk, ScanRegion target, int playerY, boolean discovery) {
+		if (queuedChunks.add(chunk.toLong())) {
+			ScanTask task = new ScanTask(chunk, target, playerY, discovery);
+			queue.addLast(task);
 		}
 	}
 
 	private void processQueue(ClientWorld world) {
 		int budget = BLOCKS_PER_TICK;
 		long deadline = System.nanoTime() + MAX_SCAN_NANOS_PER_TICK;
-		while (budget > 0 && !queue.isEmpty()) {
+		// Eligible updates have priority over both initial scans and periodic passes.
+		while (budget > 0 && System.nanoTime() < deadline) {
+			Long packed = updates.pollReady();
+			if (packed == null) {
+				break;
+			}
+			BlockPos pos = BlockPos.fromLong(packed);
+			WorldChunk chunk = world.getChunkManager().getWorldChunk(pos.getX() >> 4, pos.getZ() >> 4, false);
+			if (chunk != null && region.contains(pos.getX(), pos.getY(), pos.getZ())) {
+				BlockState state = chunk.getBlockState(pos);
+				cache.setMatch(chunk.getPos().toLong(), packed, matches(state));
+			}
+			budget--;
+		}
+		while (budget > 0 && !queue.isEmpty() && System.nanoTime() < deadline) {
 			ScanTask task = queue.peekFirst();
-			WorldChunk chunk = world.getChunkManager().getWorldChunk(task.chunkX, task.chunkZ, false);
+			WorldChunk chunk = world.getChunkManager().getWorldChunk(task.chunk.x, task.chunk.z, false);
 			if (chunk == null) {
-				queue.removeFirst();
-				queuedChunks.remove(task.chunkKey());
+				removeChunk(task.chunk.toLong());
 				continue;
 			}
-
-			int processed = task.scan(chunk, selectedBlocks, Math.min(budget, SCAN_BATCH_SIZE));
+			int processed = task.scan(chunk, Math.min(budget, SCAN_BATCH_SIZE), deadline);
 			budget -= processed;
-			boolean complete = task.isComplete();
-			// Keep the previous complete result visible while a refresh is in progress.
-			if (task.publishPartial && task.hasNewMatchesSincePublish() && task.shouldPublish()) {
-				cache.replaceChunk(task.chunkKey(), task.matches);
-				task.markPublished();
-			}
-			if (complete) {
-				cache.replaceChunk(task.chunkKey(), task.matches);
-			}
-			if (complete) {
+			if (task.complete()) {
+				scannedRegions.put(task.chunk.toLong(), task.target);
 				queue.removeFirst();
-				queuedChunks.remove(task.chunkKey());
-			}
-			if (processed == 0 && !complete) {
-				break;
-			}
-			if (System.nanoTime() >= deadline) {
+				queuedChunks.remove(task.chunk.toLong());
+			} else if (processed == 0) {
 				break;
 			}
 		}
 	}
 
-	private void pruneUnloadedChunks(ClientWorld world) {
-		for (long chunkKey : cache.chunkKeys()) {
-			int chunkX = ChunkPos.getPackedX(chunkKey);
-			int chunkZ = ChunkPos.getPackedZ(chunkKey);
-			if (!world.isChunkLoaded(chunkX, chunkZ)) {
-				cache.removeChunk(chunkKey);
-			}
-		}
+	private boolean matches(BlockState state) {
+		return !state.isAir() && selectedBlocks.isSelected(state.getBlock());
 	}
 
-	private void schedulePeriodicRefresh(ClientWorld world, BlockPos playerPos) {
-		List<Long> loadedKeys = cache.chunkKeys();
-		ChunkPos center = new ChunkPos(playerPos);
-		int chunkRadius = Math.max(1, (config.radius + 15) / 16 + 1);
-		loadedKeys.sort(Comparator.comparingLong(chunkKey -> {
-			long dx = (long) ChunkPos.getPackedX(chunkKey) - center.x;
-			long dz = (long) ChunkPos.getPackedZ(chunkKey) - center.z;
-			return dx * dx + dz * dz;
-		}));
-		for (long chunkKey : loadedKeys) {
-			int chunkX = ChunkPos.getPackedX(chunkKey);
-			int chunkZ = ChunkPos.getPackedZ(chunkKey);
-			if (Math.abs(chunkX - center.x) > chunkRadius || Math.abs(chunkZ - center.z) > chunkRadius) {
-				continue;
-			}
-			if (world.isChunkLoaded(chunkX, chunkZ) && queuedChunks.add(chunkKey)) {
-				queue.addLast(new ScanTask(chunkX, chunkZ, scanCenterY, world.getBottomY(), world.getHeight(), false));
+	private void cancelPeriodicWork() {
+		Iterator<ScanTask> iterator = queue.iterator();
+		while (iterator.hasNext()) {
+			ScanTask task = iterator.next();
+			if (!task.discovery) {
+				queuedChunks.remove(task.chunk.toLong());
+				iterator.remove();
 			}
 		}
+		updates.postponeReady();
 	}
 
-	private static final class ScanTask {
-		private final int chunkX;
-		private final int chunkZ;
+	private void pruneOutsideRegion(ClientWorld world) {
+		Set<Long> known = new HashSet<>(scannedRegions.keySet());
+		known.addAll(cache.chunkKeys());
+		known.addAll(queuedChunks);
+		for (long key : known) {
+			int x = ChunkPos.getPackedX(key);
+			int z = ChunkPos.getPackedZ(key);
+			if (!region.includesChunk(x, z) || !world.isChunkLoaded(x, z)) {
+				removeChunk(key);
+			}
+		}
+		updates.retain(packed -> region.contains(BlockPos.unpackLongX(packed),
+				BlockPos.unpackLongY(packed), BlockPos.unpackLongZ(packed)));
+	}
+
+	private void removeChunk(long key) {
+		cache.removeChunk(key);
+		scannedRegions.remove(key);
+		if (queuedChunks.remove(key)) {
+			queue.removeIf(task -> task.chunk.toLong() == key);
+		}
+		updates.retain(packed -> ChunkPos.toLong(BlockPos.unpackLongX(packed) >> 4,
+				BlockPos.unpackLongZ(packed) >> 4) != key);
+	}
+
+	private final class ScanTask {
+		private final ChunkPos chunk;
+		private final ScanRegion target;
 		private final int[] yOrder;
-		private final boolean publishPartial;
-		private final Set<Long> matches = new HashSet<>();
+		private final boolean discovery;
+		private final int width;
+		private final int planeSize;
+		private byte[] sectionSelection;
 		private int index;
-		private int lastPublishedIndex = -1;
-		private int lastPublishedMatchCount;
 
-		private ScanTask(int chunkX, int chunkZ, int playerY, int bottomY, int height, boolean publishPartial) {
-			this.chunkX = chunkX;
-			this.chunkZ = chunkZ;
-			this.yOrder = createVerticalOrder(playerY, bottomY, height);
-			this.publishPartial = publishPartial;
+		private ScanTask(ChunkPos chunk, ScanRegion target, int playerY, boolean discovery) {
+			this.chunk = chunk;
+			this.target = target;
+			this.discovery = discovery;
+			this.width = target.maxX() - target.minX() + 1;
+			this.planeSize = width * (target.maxZ() - target.minZ() + 1);
+			this.yOrder = verticalOrder(playerY, target.minY(), target.maxY());
 		}
 
-		private int scan(WorldChunk chunk, SelectedBlockManager selectedBlocks, int budget) {
-			int totalBlocks = yOrder.length * 256;
-			int start = index;
-			BlockPos.Mutable mutable = new BlockPos.Mutable();
-			while (index < totalBlocks && index - start < budget) {
-				int localX = index & 15;
-				int localZ = (index >> 4) & 15;
-				int y = yOrder[index >> 8];
-				mutable.set((chunkX << 4) + localX, y, (chunkZ << 4) + localZ);
-				BlockState state = chunk.getBlockState(mutable);
-				if (!state.isAir() && selectedBlocks.isSelected(state.getBlock())) {
-					matches.add(mutable.asLong());
+		private int scan(WorldChunk worldChunk, int budget, long deadline) {
+			ChunkSection[] sections = worldChunk.getSectionArray();
+			if (sectionSelection == null) {
+				sectionSelection = new byte[sections.length];
+			}
+			BlockPos.Mutable pos = new BlockPos.Mutable();
+			int visited = 0;
+			while (!complete() && visited < budget && System.nanoTime() < deadline) {
+				int y = yOrder[index / planeSize];
+				int sectionIndex = (y - currentWorld.getBottomY()) >> 4;
+				if (sectionSelection[sectionIndex] == 0) {
+					ChunkSection section = sections[sectionIndex];
+					sectionSelection[sectionIndex] = (byte) (!section.isEmpty() && section.hasAny(BlockScanner.this::matches) ? 2 : 1);
+				}
+				if (sectionSelection[sectionIndex] == 1 && !cache.hasMatchesInSection(chunk.toLong(), y >> 4)) {
+					index += planeSize - index % planeSize;
+					continue;
+				}
+				int horizontal = index % planeSize;
+				pos.set(target.minX() + horizontal % width, y, target.minZ() + horizontal / width);
+				long packed = pos.asLong();
+				// A background pass must not publish a newly changed position before
+				// that update becomes eligible at the configured refresh deadline.
+				if (!updates.isWaiting(packed)) {
+					cache.setMatch(chunk.toLong(), packed, matches(worldChunk.getBlockState(pos)));
 				}
 				index++;
+				visited++;
 			}
-			return index - start;
+			return visited;
 		}
 
-		private boolean isComplete() {
-			return index >= yOrder.length * 256;
+		private boolean complete() {
+			return index >= yOrder.length * planeSize;
 		}
+	}
 
-		private boolean hasNewMatchesSincePublish() {
-			return matches.size() != lastPublishedMatchCount;
-		}
-
-		private boolean shouldPublish() {
-			return lastPublishedIndex < 0 || index - lastPublishedIndex >= BLOCKS_PER_TICK;
-		}
-
-		private void markPublished() {
-			lastPublishedIndex = index;
-			lastPublishedMatchCount = matches.size();
-		}
-
-		private long chunkKey() {
-			return ChunkPos.toLong(chunkX, chunkZ);
-		}
-
-		private static int[] createVerticalOrder(int playerY, int bottomY, int height) {
-			int[] order = new int[height];
-			int topY = bottomY + height;
-			int centerY = Math.max(bottomY, Math.min(topY - 1, playerY));
-			int count = 0;
-			for (int distance = 0; count < height; distance++) {
-				int above = centerY + distance;
-				if (above < topY) {
-					order[count++] = above;
-				}
-				if (distance > 0) {
-					int below = centerY - distance;
-					if (below >= bottomY) {
-						order[count++] = below;
-					}
-				}
+	private static int[] verticalOrder(int playerY, int bottomY, int topY) {
+		int[] order = new int[Math.max(0, topY - bottomY + 1)];
+		int center = Math.max(bottomY, Math.min(topY, playerY));
+		int count = 0;
+		for (int distance = 0; count < order.length; distance++) {
+			if (center + distance <= topY) {
+				order[count++] = center + distance;
 			}
-			return order;
+			if (distance > 0 && center - distance >= bottomY) {
+				order[count++] = center - distance;
+			}
 		}
+		return order;
 	}
 }

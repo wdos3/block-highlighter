@@ -13,17 +13,19 @@
 - `HighlightConfig` / `ConfigManager`: versioned JSON configuration and atomic writes.
 - `SelectedBlockManager`: registry-ID based selection operations and validation.
 - `BlockSearchIndex` / `SearchMatcher`: one-time registry index plus cached instant filtering.
-- `BlockScanner` / `HighlightCache`: main-thread incremental chunk scanning and per-chunk match storage.
+- `BlockScanner` / `ScanRegion` / `HighlightCache`: bounded, palette-aware, main-thread discovery and incremental per-chunk match storage.
+- `RefreshCycle` / `PendingBlockUpdates`: monotonic deadlines and changed-position work that takes priority over background scans.
+- `ClientWorldMixin`: collects local/predicted and authoritative client block updates without accessing the world off-thread.
 - `HighlightRenderer`: state-accurate shape extraction and through-wall GPU line rendering.
 - `HighlightScreen`: Minecraft-native search, two scrollable lists, selection controls, and settings.
 - `HighlightHud`: optional unobtrusive status indicator.
 
 ## Scanning and caching
 
-1. While highlighting is enabled and a client world exists, the scanner discovers loaded chunks inside the configured radius around the player, queueing the player's chunk and then expanding outward so nearby matches are found first.
-2. Each chunk is scanned over multiple client ticks with a fixed block budget, starting at the player's Y-level so nearby matches are found promptly. Partial matches are published while scanning continues; world and chunk access never leaves the client thread.
-3. A completed scan replaces that chunk's match set atomically. Periodic refreshes catch state changes even when a renderer-specific block update callback is unavailable.
-4. Unloaded chunks are removed from the cache. World/dimension changes reset all chunk state, preventing coordinates from one dimension leaking into another.
+1. While highlighting is enabled and a client world exists, the scanner discovers loaded chunks intersecting the radius bounding box, ordered nearest-first. Each task is clipped horizontally and vertically; section palettes skip irrelevant sections unless cached matches need validation.
+2. Block-change notifications are deduplicated. At each monotonic refresh deadline, eligible changed positions are processed before background tasks, using the same 4,096-position / 2 ms client-tick budget. Background tasks cannot publish changes still awaiting a deadline.
+3. Scan results update individual cached positions incrementally. Periodic bounded rescans catch changes not represented by individual notifications. Interval changes cancel old periodic tasks and rebase pending updates and the timer, without clearing existing highlights.
+4. Chunk load/replacement and unload events invalidate old chunk state. World/dimension changes reset all state, preventing coordinates from one dimension leaking into another. Movement schedules discovery for newly uncovered regions.
 5. Rendering rebuilds a reusable world-coordinate vertex buffer only when cached data, settings, player block position, or a periodic state refresh changes. Each rebuild applies a precise player-distance check and reads the current block state before drawing; selection changes schedule loaded chunks for refresh without a frame-wide world scan.
 
 ## Rendering

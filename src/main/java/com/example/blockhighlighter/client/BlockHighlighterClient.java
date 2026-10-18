@@ -7,11 +7,14 @@ import com.example.blockhighlighter.render.HighlightRenderer;
 import com.example.blockhighlighter.scan.BlockScanner;
 import com.example.blockhighlighter.scan.HighlightCache;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
@@ -49,6 +52,8 @@ public final class BlockHighlighterClient implements ClientModInitializer {
 		ClientTickEvents.START_CLIENT_TICK.register(BlockHighlighterCommands::handlePendingOpen);
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> scanner.reset());
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> scanner.reset());
+		ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> scanner.chunkLoaded(world, chunk.getPos()));
+		ClientChunkEvents.CHUNK_UNLOAD.register((world, chunk) -> scanner.chunkUnloaded(world, chunk.getPos()));
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
 			HighlightRenderer.close();
 			saveConfig();
@@ -86,6 +91,12 @@ public final class BlockHighlighterClient implements ClientModInitializer {
 	public static void selectionChanged() {
 		if (scanner != null) {
 			scanner.invalidateLoadedChunks();
+		}
+	}
+
+	public static void blockUpdated(ClientWorld world, BlockPos pos) {
+		if (scanner != null) {
+			scanner.blockUpdated(world, pos);
 		}
 	}
 
